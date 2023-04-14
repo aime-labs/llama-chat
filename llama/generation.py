@@ -25,6 +25,8 @@ class LLaMA:
         params = self.model.params
         assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
 
+        count_newlines = prompts[0].count("\n")
+
         prompt_tokens = [self.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
 
         min_prompt_size = min([len(t) for t in prompt_tokens])
@@ -38,6 +40,8 @@ class LLaMA:
         input_text_mask = tokens != self.tokenizer.pad_id
         start_pos = min_prompt_size
         prev_pos = 0
+        decoded = [None] * bsz
+
         for cur_pos in range(start_pos, total_len):
             logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
             if temperature > 0:
@@ -53,16 +57,21 @@ class LLaMA:
             tokens[:, cur_pos] = next_token
             prev_pos = cur_pos
 
-        decoded = []
-        for i, t in enumerate(tokens.tolist()):
-            # cut to max gen len
-            t = t[: len(prompt_tokens[i]) + max_gen_len]
-            # cut to eos tok if any
-            try:
-                t = t[: t.index(self.tokenizer.eos_id)]
-            except ValueError:
-                pass
-            decoded.append(self.tokenizer.decode(t))
+            for i, t in enumerate(tokens.tolist()):
+                # cut to max gen len
+                t = t[: min(cur_pos, len(prompt_tokens[i]) + max_gen_len)]
+                # cut to eos tok if any
+                try:
+                    t = t[: t.index(self.tokenizer.eos_id)]
+                except ValueError:
+                    pass
+                d = self.tokenizer.decode(t)    
+                decoded[i] = d
+
+                result_count_newlines = d.count("\n")
+                if result_count_newlines > count_newlines:
+                    return decoded
+
         return decoded
 
 
