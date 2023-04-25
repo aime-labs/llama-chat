@@ -38,7 +38,8 @@ def load(
     max_batch_size: int,
 ) -> LLaMA:
     start_time = time.time()
-    checkpoints = sorted(Path(ckpt_dir).glob("*.pth"))
+    checkpoints = sorted(Path(ckpt_dir).glob(f'merged.{world_size}GPUs.*.pth'))
+    print('checkpoints', checkpoints)
     assert world_size == len(
         checkpoints
     ), f"Loading a checkpoint for MP={len(checkpoints)} but world size is {world_size}"
@@ -67,9 +68,9 @@ def main(
     ckpt_dir: str,
     tokenizer_path: str,
     temperature: float = 0.8,
-    top_p: float = 0.95,
+    top_p: float = 1,
     max_seq_len: int = 2048,
-    max_batch_size: int = 32,
+    max_batch_size: int = 8,
 ):
     local_rank, world_size = setup_model_parallel()
     if local_rank > 0:
