@@ -63,7 +63,7 @@ def load(
     model.load_state_dict(checkpoint, strict=False)
     
 
-    generator = LLaMA(model, tokenizer, True)
+    generator = LLaMA(model, tokenizer)
     print(f"Loaded in {time.time() - start_time:.2f} seconds")
     return generator
 
@@ -74,29 +74,51 @@ def main():
         sys.stdout = open(os.devnull, "w")
     args=load_flags()
 
+
+    if not args.prompts:
+        prompts = [
+            # For these prompts, the expected answer is the natural continuation of the prompt
+            "I believe the meaning of life is",
+            "Simply put, the theory of relativity states that ",
+            "Building a website can be done in 10 simple steps:\n",
+            """Tweet: "I hate it when my phone battery dies."
+Sentiment: Negative
+###
+Tweet: "My day has been 👍"
+Sentiment: Positive
+###
+Tweet: "This is the link to the article"
+Sentiment: Neutral
+###
+Tweet: "This new music video was incredibile"
+Sentiment:""",
+        """Translate English to French:
+
+sea otter => loutre de mer
+
+peppermint => menthe poivrée
+
+plush girafe => girafe peluche
+
+cheese =>""",
+        ]
+    else:
+        prompts = args.prompts.split(';')
+
+    if not args.max_batch_size:
+        args.max_batch_size = len(prompts)
+
     generator = load(
         args.ckpt_dir, args.tokenizer_path, local_rank, world_size, args.max_seq_len, args.max_batch_size
     )
 
-    ctx = """A dialog, where User interacts with AI. AI is helpful, kind, obedient, honest and very reasonable.
-User: Hello, AI.
-AI: How can I assist you today?"""        
-    print(ctx)
-    while True:
-        prompts = []
+    results = generator.generate(
+        prompts, max_gen_len=512, temperature=args.temperature, top_p=args.top_p, top_k=args.top_k, repetition_penalty=args.repetition_penalty
+    )
 
-        if local_rank == 0:
-            ctx += "User: " + input(f'User: ') + "\n"
-            prompts.append(ctx)
-        else:
-            prompts.append("")
-
-        torch.distributed.broadcast_object_list(prompts, 0)
-
-        results = generator.generate(
-            prompts, max_gen_len=512, temperature=args.temperature, top_p=args.top_p, top_k=args.top_k, repetition_penalty=args.repetition_penalty
-        )
-        ctx = results[0]
+    for result in results:
+        print(result)
+        print("\n==================================\n")
 
 def load_flags():
     parser = argparse.ArgumentParser()
@@ -125,12 +147,16 @@ def load_flags():
         help="Maximum sequence length",
     )
     parser.add_argument(
-        "--max_batch_size", type=int, default=1, required=False,
+        "--max_batch_size", type=int, required=False,
         help="Maximum batch size",
     )    
     parser.add_argument(
         "--repetition_penalty", type=float, default=(1.0/0.85), required=False,
         help="Repetition penalty",
+    )
+    parser.add_argument(
+        "--prompts", type=str, required=False,
+        help="Prompt for text generation. Multiple prompts should be seperated by ;"
     )
 
     

@@ -58,7 +58,7 @@ def load(
     torch.set_default_tensor_type(torch.FloatTensor)
     model.load_state_dict(checkpoint, strict=False)
 
-    generator = LLaMA(model, tokenizer)
+    generator = LLaMA(model, tokenizer, False)
     print(f"Loaded in {time.time() - start_time:.2f} seconds")
     return generator
 
