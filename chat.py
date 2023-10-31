@@ -8,25 +8,33 @@ import torch
 import time
 import json
 import argparse
-
+import numpy as np
+import random
 from pathlib import Path
 
 from fairscale.nn.model_parallel.initialize import initialize_model_parallel
 
 from llama import ModelArgs, Transformer, Tokenizer, LLaMA
+import sys
+
+from api_worker_interface import APIWorkerInterface
 
 
-def setup_model_parallel() -> Tuple[int, int]:
+WORKER_JOB_TYPE = "llama"
+WORKER_AUTH_KEY = "5b07e305b50505ca2b3284b4ae5f65d1"
+
+def setup_model_parallel(args) -> Tuple[int, int]:
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
     world_size = int(os.environ.get("WORLD_SIZE", -1))
 
     torch.distributed.init_process_group("nccl")
     initialize_model_parallel(world_size)
-    torch.cuda.set_device(local_rank)
+    torch.cuda.set_device(local_rank+args.gpu_id)
 
     # seed must be the same in all processes
     torch.manual_seed(1)
     return local_rank, world_size
+
 
 
 def load(
@@ -40,7 +48,11 @@ def load(
 ) -> LLaMA:
     start_time = time.time()
     checkpoints = sorted(Path(ckpt_dir).glob(f'merged.{world_size}GPUs.*.pth'))
+    if not checkpoints:
+        checkpoints = sorted(Path(ckpt_dir).glob(f'consolidated.*.pth'))
+
     print('checkpoints', checkpoints)
+    assert checkpoints, f'No checkpoint found in {ckpt_dir}'
     assert world_size == len(
         checkpoints
     ), f"Loading a checkpoint for MP={len(checkpoints)} but world size is {world_size}"
@@ -62,41 +74,105 @@ def load(
     torch.set_default_tensor_type(torch.FloatTensor)
     model.load_state_dict(checkpoint, strict=False)
     
-
     generator = LLaMA(model, tokenizer, True)
     print(f"Loaded in {time.time() - start_time:.2f} seconds")
     return generator
 
 
 def main():
-    local_rank, world_size = setup_model_parallel()
-    if local_rank > 0:
-        sys.stdout = open(os.devnull, "w")
-    args=load_flags()
+    """
+    Entry point of the program for generating text using a pretrained model.
 
+    Args:
+        ckpt_dir (str): The directory containing checkpoint files for the pretrained model.
+        tokenizer_path (str): The path to the tokenizer model used for text encoding/decoding.
+        temperature (float, optional): The temperature value for controlling randomness in generation.
+            Defaults to 0.6.
+        top_p (float, optional): The top-p sampling parameter for controlling diversity in generation.
+            Defaults to 0.9.
+        max_seq_len (int, optional): The maximum sequence length for input prompts. Defaults to 512.
+        max_batch_size (int, optional): The maximum batch size for generating sequences. Defaults to 8.
+        max_gen_len (int, optional): The maximum length of generated sequences. If None, it will be
+            set to the model's max sequence length. Defaults to None.
+    """
+    args = load_flags()
+    if not args.tokenizer_path:
+        args.tokenizer_path = str(Path(args.ckpt_dir).parent / 'tokenizer.model')
+    local_rank, world_size = setup_model_parallel(args)
     generator = load(
-        args.ckpt_dir, args.tokenizer_path, local_rank, world_size, args.max_seq_len, args.max_batch_size
+        ckpt_dir=args.ckpt_dir,
+        tokenizer_path=args.tokenizer_path,
+        local_rank=local_rank,
+        world_size=world_size,
+        max_seq_len=args.max_seq_len,
+        max_batch_size=args.max_batch_size,
     )
+    
+    if args.api_server:
+        from api_worker_interface import APIWorkerInterface
+        api_worker = APIWorkerInterface(args.api_server, WORKER_JOB_TYPE, WORKER_AUTH_KEY, args.gpu_id, world_size=world_size, rank=local_rank)
+        callback = ProcessOutputCallback(local_rank, api_worker)
+        ctx = ""
+        while True:
+            prompts = []
+            
+            job_data = api_worker.job_request()
+            set_seed(job_data.get('seed'))
+            print(f'processing job {job_data.get("job_id")}....', end='', flush=True)
+            if local_rank == 0:
+                callback.job_data = job_data
+                ctx = job_data['text']
+                prompts.append(ctx)
+            else:
+                prompts.append("")
 
-    ctx = """A dialog, where User interacts with AI. AI is helpful, kind, obedient, honest and very reasonable.
-User: Hello, AI.
-AI: How can I assist you today?"""        
-    print(ctx)
-    while True:
-        prompts = []
+        #        torch.distributed.barrier()    # not useable! Does active CPU waiting and times out with an error after about 30 minutes!
 
-        if local_rank == 0:
-            ctx += "User: " + input(f'User: ') + "\n"
-            prompts.append(ctx)
-        else:
-            prompts.append("")
+            torch.distributed.broadcast_object_list(prompts, 0)
+            top_p = get_parameter('top_p', float, 0.9, args, job_data, local_rank)
+            top_k = get_parameter('top_k', int, 40, args, job_data, local_rank)
+            temperature = get_parameter('temperature', float, 0.8, args, job_data, local_rank)
 
-        torch.distributed.broadcast_object_list(prompts, 0)
+            results = generator.generate(
+                callback.process_output, prompts, max_gen_len=512, temperature=temperature, top_p=top_p, top_k=top_k, repetition_penalty=args.repetition_penalty
+            )
+            print('Done')
+            ctx = results[0]
+    else:
+        callback = ProcessOutputToShellCallback()
+        ctx = """A dialog, where User interacts with an helpful, kind, obedient, honest and very reasonable assistant called Dave.
+User: Hello, Dave.
+Dave: How can I assist you today?
+"""
+        print(ctx)
+        while True:
+            
+            prompt = input(f'User: ')
+            if ctx != "":
+                ctx = ctx + "User: " + prompt + "\n"
+            else:
+                ctx = prompt + "\n"
+            
+            prompts = [ctx]
+            if not args.temperature:
+                args.temperature = 0.8
+            if not args.top_p:
+                args.top_p = 0.9
+            if not args.top_k:
+                args.top_k = 40
+            results = generator.generate(
+                callback.process_output, prompts, max_gen_len=512, temperature=args.temperature, top_p=args.top_p, top_k=args.top_k, repetition_penalty=args.repetition_penalty
+            )
+            ctx = callback.ctx
+            
 
-        results = generator.generate(
-            prompts, max_gen_len=512, temperature=args.temperature, top_p=args.top_p, top_k=args.top_k, repetition_penalty=args.repetition_penalty
-        )
-        ctx = results[0]
+
+def set_seed(seed):
+
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+
 
 def load_flags():
     parser = argparse.ArgumentParser()
@@ -109,15 +185,15 @@ def load_flags():
         help="Location of tokenizer"
     )
     parser.add_argument(
-        '--temperature', type=float, default=0.8, required=False,
+        '--temperature', type=float, required=False,
     help='Temperature'
                     )
     parser.add_argument(
-        "--top_p", type=float, default=0.9, required=False,
+        "--top_p", type=float, required=False,
         help="Top_p, 0=<top_p<=1"
     )
     parser.add_argument(
-        "--top_k", type=int, default=40, required=False,
+        "--top_k", type=int, required=False,
         help="Top_k, 0=<top_k<=1",
     )
     parser.add_argument(
@@ -132,9 +208,56 @@ def load_flags():
         "--repetition_penalty", type=float, default=(1.0/0.85), required=False,
         help="Repetition penalty",
     )
+    parser.add_argument(
+        "--api_server", type=str, required=False,
+        help="Address of the API server"
+    )
+    parser.add_argument(
+        "--gpu_id", type=int, default=0, required=False,
+        help="ID of the GPU to be used"
+    )
 
     
     return parser.parse_args()
+
+def get_parameter(parameter_name, parameter_type, default_value, args, job_data, local_rank):
+    parameter = default_value
+    if local_rank == 0:
+        if getattr(args, parameter_name) is not None:
+            parameter = getattr(args, parameter_name)
+        elif parameter_type(job_data[parameter_name]) is not None:
+            parameter = parameter_type(job_data[parameter_name]) 
+    parameter_list = [parameter]
+    torch.distributed.broadcast_object_list(parameter_list, 0)
+    return parameter_list[0]
+
+
+
+class ProcessOutputCallback():
+    def __init__(self, local_rank, api_worker):
+        self.local_rank = local_rank
+        self.api_worker = api_worker
+        self.job_data = None
+
+
+    def process_output(self, output, num_generated_tokens, finished):
+        if self.local_rank == 0:
+            results = {'text': output}
+            if finished:
+                self.job_data['num_generated_tokens'] = num_generated_tokens
+                return self.api_worker.send_job_results(self.job_data, results)
+            elif self.api_worker.progress_data_received:
+                return self.api_worker.send_progress(self.job_data, num_generated_tokens, results)
+
+
+class ProcessOutputToShellCallback():
+    def __init__(self):
+        self.ctx = ""
+
+    def process_output(self, output, num_generated_tokens, finished):
+        if finished:
+            self.ctx = output
+            print(f'\n{output}')
 
 
 if __name__ == "__main__":

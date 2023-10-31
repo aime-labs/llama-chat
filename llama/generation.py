@@ -17,106 +17,130 @@ class LLaMA:
 
     def generate(
             self,
+            process_output_callback,
             prompts: List[str],
             max_gen_len: int,
             temperature: float = 0.8,
             top_p: float = 0.95,
             top_k: int = 40,
             repetition_penalty: float = (1.0 / 0.85),
+            logprobs: bool = False,
+            echo: bool = False,
     ) -> List[str]:
-        bsz = len(prompts)
+        prompt_tokens = [self.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
         params = self.model.params
+        bsz = len(prompt_tokens)
         assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
 
-        count_newlines = prompts[0].count("\n")
+        min_prompt_len = min(len(t) for t in prompt_tokens)
+        max_prompt_len = max(len(t) for t in prompt_tokens)
+        assert max_prompt_len <= params.max_seq_len
+        total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)
 
-        prompt_tokens = [self.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
-
-        min_prompt_size = min([len(t) for t in prompt_tokens])
-        max_prompt_size = max([len(t) for t in prompt_tokens])
-
-        total_len = min(params.max_seq_len, max_gen_len + max_prompt_size)
-
-        tokens = torch.full((bsz, total_len), self.tokenizer.pad_id).cuda().long()
+        pad_id = self.tokenizer.pad_id
+        
+        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
         for k, t in enumerate(prompt_tokens):
-            tokens[k, : len(t)] = torch.tensor(t).long()
-            tokens[k, -1] = self.tokenizer.eos_id
-        input_text_mask = tokens != self.tokenizer.pad_id
-        start_pos = min_prompt_size
+            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+        if logprobs:
+            token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
         prev_pos = 0
-        decoded = [None] * bsz
+        eos_reached = torch.tensor([False] * bsz, device="cuda")
+        input_text_mask = tokens != pad_id
+        if min_prompt_len == total_len:
+            logits = self.model.forward(tokens, prev_pos)
+            token_logprobs = -F.cross_entropy(
+                input=logits.transpose(1, 2),
+                target=tokens,
+                reduction="none",
+                ignore_index=pad_id,
+            )
         word = []
-
-        for cur_pos in range(start_pos, total_len):
+        generated_text = ""
+        num_generated_tokens = 0
+        for cur_pos in range(min_prompt_len, total_len):
+            num_generated_tokens += 1
             logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
-            # repetition penalty from CTRL paper (https://arxiv.org/abs/1909.05858)
-            if repetition_penalty != 1.0:
-                logits_new = logits.clone()
-                batch_size = len(tokens)
-                for i in range(batch_size):
-                    for token in set(tokens[i].tolist()):
-                        # if score < 0 then repetition penalty has to multiplied to reduce the previous token probability
-                        if logits[i, token] < 0:
-                            logits_new[i, token] = logits[i, token] * repetition_penalty
-                        else:
-                            logits_new[i, token] = logits[i, token] / repetition_penalty
-                logits = logits_new
-
             if temperature > 0:
                 probs = torch.softmax(logits / temperature, dim=-1)
-                next_token = sample_top_k(probs, top_p=top_p, top_k=top_k)
+                next_token = sample_top_k(probs, top_p, top_k)
             else:
-                next_token = torch.argmax(logits, dim=-1)
-                           
+                next_token = torch.argmax(logits[:, -1], dim=-1)
+
             next_token = next_token.reshape(-1)
             # only replace token if prompt has already been generated
             next_token = torch.where(
                 input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
             )
+            if next_token != self.tokenizer.eos_id:
+                word.append(next_token.item())
+            word_str = self.tokenizer.decode(word)
+            if " " in word_str:
+                text = word_str[:word_str.find(" ") + 1]
+                generated_text += text
+                process_output_callback(generated_text, num_generated_tokens, False)
+                word = word[-1:]
+
+
             tokens[:, cur_pos] = next_token
-            if self.chat_mode:
-                if self.tokenizer.decode(next_token.item()) != 'User':
-                    word.append(next_token.item())
-                word_str = self.tokenizer.decode(word)
+            mask = tokens != -1
 
-                if " " in word_str:
-                    print(word_str[:word_str.find(" ")+1], end='')
-                    word = word[-1:]
+            # replace -1 values with 2
+            tokens = torch.where(mask, tokens, torch.ones_like(tokens)*self.tokenizer.eos_id)
 
-                prev_pos = cur_pos
+            if logprobs:
+                token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(
+                    input=logits.transpose(1, 2),
+                    target=tokens[:, prev_pos + 1 : cur_pos + 1],
+                    reduction="none",
+                    ignore_index=pad_id,
+                )
 
-            for i, t in enumerate(tokens.tolist()):
-                # i = cur_pos
-                # t = next_token
-                # cut to max gen len
-                # t = t[: len(prompt_tokens[i]) + max_gen_len]
-                t = t[: min(cur_pos, len(prompt_tokens[i]) + max_gen_len)]
-                
-                # cut to eos tok if any
-                try:
-                    t = t[: t.index(self.tokenizer.eos_id)]
-                except ValueError:
-                    pass
 
-                try:
-                    d = self.tokenizer.decode(t)
-                    #if not self.chat_mode:
-                    #    print(d)
-                    decoded[i] = d                    
-                    result_count_newlines = d.count("\n")
-                    if result_count_newlines > count_newlines:
-                        if self.chat_mode:
-                            word=word[:-1]
-                            word_str = self.tokenizer.decode(word)
-                            print(word_str)
-                            return decoded
+            prev_pos = cur_pos
+            if '\nUser:' in word_str:
 
-                except IndexError:
-                    traceback.print_exc()
-                    print(t)
+                break
+            eos_reached |= (~input_text_mask[:, cur_pos]) & (
+                next_token == self.tokenizer.eos_id
+            )
+            if all(eos_reached):
+                break
 
+
+            #print('ä', word_str)
+
+        if logprobs:
+            token_logprobs = token_logprobs.tolist()
+        out_tokens, out_logprobs = [], []
+        for i, toks in enumerate(tokens.tolist()):
+
+            start = 0 if echo else len(prompt_tokens[i])
+            #toks = toks[start : len(prompt_tokens[i]) + max_gen_len]
+            probs = None
+            if logprobs:
+                probs = token_logprobs[i][start : len(prompt_tokens[i]) + max_gen_len]
+            # cut to eos tok if any
+            if self.tokenizer.eos_id in toks:
+                eos_idx = toks.index(self.tokenizer.eos_id)
+                toks = toks[:eos_idx]
+                probs = probs[:eos_idx] if logprobs else None
+            if self.tokenizer.pad_id in toks:
+                pad_idx = toks.index(self.tokenizer.pad_id)
+                toks = toks[:pad_idx]
+                probs = probs[:pad_idx] if logprobs else None
+            
+
+            final_result = self.tokenizer.decode(toks).strip('User:')
+
+            process_output_callback(final_result, num_generated_tokens, True)
+            out_tokens.append(toks)
+            output = ''
+            
+            out_logprobs.append(probs)
         
-        return decoded
+        return (out_tokens, out_logprobs if logprobs else None)
+
 
 
 def sample_top_k(probs, top_p=0.0, top_k=40):

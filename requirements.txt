@@ -1,3 +1,4 @@
 torch
 fairscale
 sentencepiece
+api_worker_interface @ git+https://github.com//aime-labs/api_worker_interface

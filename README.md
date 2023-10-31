@@ -3,16 +3,23 @@
 This repository is intended as a minimal, hackable and readable example to load [LLaMA](https://ai.facebook.com/blog/large-language-model-llama-meta-ai/) ([arXiv](https://arxiv.org/abs/2302.13971v1)) models and run inference.
 In order to download the checkpoints and tokenizer, fill this [google form](https://forms.gle/jk851eBVbX1m5TAv5)
 
-## Setup
-
-In a conda env with pytorch / cuda available, run:
+## Setup with AIME MLC
+Create an AIME ML container:
+```mlc-create mycontainer Pytorch 2.1.0-aime```
+Once done open the container with:
+```mlc-open mycontainer```
+Navigate to the destination of the repo and install the required pip packages
 ```
+cd llama-chat
 pip install -r requirements.txt
 ```
-Then in this repository:
+
+## Start Chat in Command Line
+Run the chat mode in the command line with following command:
 ```
-pip install -e .
+torchrun --nproc_per_node <num_gpus> chat.py --ckpt_dir <destination_of_checkpoints>
 ```
+
 
 ## Download
 
