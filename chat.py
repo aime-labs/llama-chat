@@ -99,6 +99,10 @@ def main():
     if not args.tokenizer_path:
         args.tokenizer_path = str(Path(args.ckpt_dir).parent / 'tokenizer.model')
     local_rank, world_size = setup_model_parallel(args)
+    if args.api_server:
+        from api_worker_interface import APIWorkerInterface
+        api_worker = APIWorkerInterface(args.api_server, WORKER_JOB_TYPE, WORKER_AUTH_KEY, args.gpu_id, world_size=world_size, rank=local_rank)
+        callback = ProcessOutputCallback(local_rank, api_worker)
     generator = load(
         ckpt_dir=args.ckpt_dir,
         tokenizer_path=args.tokenizer_path,
@@ -109,9 +113,7 @@ def main():
     )
     
     if args.api_server:
-        from api_worker_interface import APIWorkerInterface
-        api_worker = APIWorkerInterface(args.api_server, WORKER_JOB_TYPE, WORKER_AUTH_KEY, args.gpu_id, world_size=world_size, rank=local_rank)
-        callback = ProcessOutputCallback(local_rank, api_worker)
+        
         ctx = ""
         while True:
             prompts = []
@@ -139,21 +141,24 @@ def main():
             print('Done')
             ctx = results[0]
     else:
-        callback = ProcessOutputToShellCallback()
-        ctx = """A dialog, where User interacts with an helpful, kind, obedient, honest and very reasonable assistant called Dave.
-User: Hello, Dave.
-Dave: How can I assist you today?
-"""
-        print(ctx)
+        ctx = "A dialog, where User interacts with an helpful, kind, obedient, honest and very reasonable assistant called Dave.\n" +\
+              "User: Hello, Dave.\n" +\
+              "Dave: How can I assist you today?\n"
+
+        callback = ProcessOutputToShellCallback(local_rank, ctx)
+        print(ctx, end='', flush=True)
         while True:
-            
-            prompt = input(f'User: ')
-            if ctx != "":
-                ctx = ctx + "User: " + prompt + "\n"
+            if local_rank == 0:
+                prompt = input(f'User: ')
+                if ctx != "":
+                    ctx = ctx + "User: " + prompt + "\n"
+                else:
+                    ctx = prompt + "\n"
+                
+                prompts = [ctx]
             else:
-                ctx = prompt + "\n"
-            
-            prompts = [ctx]
+                prompts = ['']
+            torch.distributed.broadcast_object_list(prompts, src=0)
             if not args.temperature:
                 args.temperature = 0.8
             if not args.top_p:
@@ -245,19 +250,30 @@ class ProcessOutputCallback():
             results = {'text': output}
             if finished:
                 self.job_data['num_generated_tokens'] = num_generated_tokens
-                return self.api_worker.send_job_results(self.job_data, results)
+                return self.api_worker.send_job_results(results, self.job_data)
             elif self.api_worker.progress_data_received:
-                return self.api_worker.send_progress(self.job_data, num_generated_tokens, results)
+                return self.api_worker.send_progress(num_generated_tokens, results)
 
 
 class ProcessOutputToShellCallback():
-    def __init__(self):
-        self.ctx = ""
+    def __init__(self, local_rank, ctx):
+        self.local_rank = local_rank
+        self.ctx = ctx
+        self.previous_token = None
 
     def process_output(self, output, num_generated_tokens, finished):
+        token = output.split(self.previous_token)[-1]
+        if self.local_rank == 0:
+            print(token, end='', flush=True)
+        
         if finished:
-            self.ctx = output
-            print(f'\n{output}')
+            self.ctx = output            
+            self.previous_token = None
+            
+        elif token:
+            self.previous_token = token
+
+
 
 
 if __name__ == "__main__":

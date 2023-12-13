@@ -7,7 +7,7 @@ from pathlib import Path
 """
 Sample usage:
     ```
-    python merge_weights.py --input_dir D:\Downloads\LLaMA --model_size 13B
+    python convert_weights.py --input_dir /home/user/workspace/LLaMA --model_size 13B --num_gpus 1
     ```
 """
 
@@ -53,7 +53,7 @@ def write_model(input_base_path, model_size, num_gpus):
             torch.load(os.path.join(input_base_path, f"consolidated.{i:02d}.pth"), map_location="cpu")
             for i in range(num_shards)
         ]
-    print('shape: ', loaded[1][f"layers.{6}.attention.wq.weight"].shape)
+    
     state_dicts = [{} for i in range(num_gpus)]
 
     for layer_i in range(n_layers):
@@ -90,42 +90,42 @@ def write_model(input_base_path, model_size, num_gpus):
                 state_dict.update({
                     f"layers.{layer_i}.attention_norm.weight": loaded[0][
                         f"layers.{layer_i}.attention_norm.weight"
-                    ],
-                    f"layers.{layer_i}.ffn_norm.weight": loaded[0][f"layers.{layer_i}.ffn_norm.weight"],
+                    ].clone(),
+                    f"layers.{layer_i}.ffn_norm.weight": loaded[0][f"layers.{layer_i}.ffn_norm.weight"].clone(),
                 })
                 state_dict[f"layers.{layer_i}.attention.wq.weight"] = torch.cat(
                     [
-                        loaded[2*gpu_id+i][f"layers.{layer_i}.attention.wq.weight"].view(n_heads_per_shard, dims_per_head, dim)
+                        loaded[int(num_shards/num_gpus)*gpu_id+i][f"layers.{layer_i}.attention.wq.weight"].clone().view(n_heads_per_shard, dims_per_head, dim).clone()
                         for i in range(int(num_shards/num_gpus))
                     ],
                     dim=0,
-                ).reshape(int(dim/num_gpus), dim)
+                ).reshape(int(dim/num_gpus), dim).clone()
                 state_dict[f"layers.{layer_i}.attention.wk.weight"] = torch.cat(
                     [
-                        loaded[2*gpu_id+i][f"layers.{layer_i}.attention.wk.weight"].view(n_heads_per_shard, dims_per_head, dim)
+                        loaded[int(num_shards/num_gpus)*gpu_id+i][f"layers.{layer_i}.attention.wk.weight"].clone().view(n_heads_per_shard, dims_per_head, dim).clone()
                         for i in range(int(num_shards/num_gpus))
                     ],
                     dim=0,
-                ).reshape(int(dim/num_gpus), dim)
+                ).reshape(int(dim/num_gpus), dim).clone()
                 state_dict[f"layers.{layer_i}.attention.wv.weight"] = torch.cat(
                     [
-                        loaded[2*gpu_id+i][f"layers.{layer_i}.attention.wv.weight"].view(n_heads_per_shard, dims_per_head, dim)
+                        loaded[int(num_shards/num_gpus)*gpu_id+i][f"layers.{layer_i}.attention.wv.weight"].clone().view(n_heads_per_shard, dims_per_head, dim).clone()
                         for i in range(int(num_shards/num_gpus))
                     ],
                     dim=0,
-                ).reshape(int(dim/num_gpus), dim)
+                ).reshape(int(dim/num_gpus), dim).clone()
                 state_dict[f"layers.{layer_i}.attention.wo.weight"] = torch.cat(
-                    [loaded[2*gpu_id+i][f"layers.{layer_i}.attention.wo.weight"] for i in range(int(num_shards/num_gpus))], dim=1
-                )
+                    [loaded[int(num_shards/num_gpus)*gpu_id+i][f"layers.{layer_i}.attention.wo.weight"].clone() for i in range(int(num_shards/num_gpus))], dim=1
+                ).clone()
                 state_dict[f"layers.{layer_i}.feed_forward.w1.weight"] = torch.cat(
-                    [loaded[2*gpu_id+i][f"layers.{layer_i}.feed_forward.w1.weight"] for i in range(int(num_shards/num_gpus))], dim=0
-                )
+                    [loaded[int(num_shards/num_gpus)*gpu_id+i][f"layers.{layer_i}.feed_forward.w1.weight"].clone() for i in range(int(num_shards/num_gpus))], dim=0
+                ).clone()
                 state_dict[f"layers.{layer_i}.feed_forward.w2.weight"] = torch.cat(
-                    [loaded[2*gpu_id+i][f"layers.{layer_i}.feed_forward.w2.weight"] for i in range(int(num_shards/num_gpus))], dim=1
-                )
+                    [loaded[int(num_shards/num_gpus)*gpu_id+i][f"layers.{layer_i}.feed_forward.w2.weight"].clone() for i in range(int(num_shards/num_gpus))], dim=1
+                ).clone()
                 state_dict[f"layers.{layer_i}.feed_forward.w3.weight"] = torch.cat(
-                    [loaded[2*gpu_id+i][f"layers.{layer_i}.feed_forward.w3.weight"] for i in range(int(num_shards/num_gpus))], dim=0
-                )
+                    [loaded[int(num_shards/num_gpus)*gpu_id+i][f"layers.{layer_i}.feed_forward.w3.weight"].clone() for i in range(int(num_shards/num_gpus))], dim=0
+                ).clone()
 
     if model_size == "7B":
         state_dict.update({
@@ -135,12 +135,13 @@ def write_model(input_base_path, model_size, num_gpus):
         })
     else:
         for gpu_id, state_dict in enumerate(state_dicts):
+            print('saving... : gpu_id: ', gpu_id)
             state_dict.update({
-                "norm.weight": loaded[0]["norm.weight"],
+                "norm.weight": loaded[0]["norm.weight"].clone(),
                 "tok_embeddings.weight": torch.cat(
-                    [loaded[2*gpu_id+i]["tok_embeddings.weight"] for i in range(int(num_shards/num_gpus))], dim=1
-                ),
-                "output.weight": torch.cat([loaded[2*gpu_id+i]["output.weight"] for i in range(int(num_shards/num_gpus))], dim=0),
+                    [loaded[int(num_shards/num_gpus)*gpu_id+i]["tok_embeddings.weight"].clone() for i in range(int(num_shards/num_gpus))], dim=1
+                ).clone(),
+                "output.weight": torch.cat([loaded[int(num_shards/num_gpus)*gpu_id+i]["output.weight"].clone() for i in range(int(num_shards/num_gpus))], dim=0).clone(),
             })
             torch.save(state_dict, Path(input_base_path) / f'merged.{num_gpus}GPUs.{gpu_id:02d}.pth')
 
