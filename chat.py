@@ -17,7 +17,7 @@ from fairscale.nn.model_parallel.initialize import initialize_model_parallel
 from llama import ModelArgs, Transformer, Tokenizer, LLaMA
 import sys
 
-from api_worker_interface import APIWorkerInterface
+from aime_api_worker_interface import APIWorkerInterface
 
 
 WORKER_JOB_TYPE = "llama"
